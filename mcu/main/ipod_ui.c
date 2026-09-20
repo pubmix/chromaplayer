@@ -46,6 +46,67 @@ static lv_obj_t *footer_label;
 static lv_style_t root_style;
 static Page page = PAGE_HOME;
 static unsigned selection;
+static char files_path[MUSIC_MAX_NAME];
+static size_t files_rows[MUSIC_MAX_FILES];
+static size_t files_row_count;
+static char files_notice[48];
+static Page player_return_page = PAGE_MUSIC;
+
+static bool files_is_child(const char *folder, const char *path)
+{
+    if (!folder || !path) return false;
+    size_t prefix = strlen(folder);
+    if (strncmp(path, folder, prefix)) return false;
+    const char *name = path + prefix;
+    if (!*name) return false;
+    const char *slash = strchr(name, '/');
+    return !slash || !slash[1];
+}
+
+static bool files_parent(char *path)
+{
+    size_t length = strlen(path);
+    if (!length) return false;
+    path[--length] = 0;
+    char *slash = strrchr(path, '/');
+    if (slash) slash[1] = 0;
+    else path[0] = 0;
+    return true;
+}
+
+static void files_refresh(void)
+{
+    files_row_count = 0;
+    for (size_t i = 0; i < MusicPlayer_GetFileCount(); ++i) {
+        if (files_is_child(files_path, MusicPlayer_GetFileName(i)))
+            files_rows[files_row_count++] = i;
+    }
+    if (selection >= files_row_count) selection = 0;
+}
+
+static bool files_up(void)
+{
+    if (!files_parent(files_path)) return false;
+    selection = 0; files_notice[0] = 0;
+    return true;
+}
+
+bool IPodUI_TestFileNavigation(void)
+{
+    // Exercise actual navigation helpers without faking a mounted card or UI files.
+    struct { const char *folder, *path; bool child; } cases[] = {
+        { "", "song.mp3", true }, { "", "Album/", true },
+        { "", "Album/song.mp3", false }, { "Album/", "Album/song.mp3", true },
+        { "Album/", "Album2/song.mp3", false }, { "Album/", "Album/", false },
+        { "Album/", "Album/Disc 1/", true }, { "Album/", "Album/Disc 1/song.mp3", false },
+        { "", "", false }, { "Album/Disc 1/", "Album/Disc 1/song.MP3", true }
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+        if (files_is_child(cases[i].folder, cases[i].path) != cases[i].child) return false;
+    char path[48] = "Album/Disc 1/";
+    return files_parent(path) && !strcmp(path, "Album/") &&
+           files_parent(path) && !path[0] && !files_parent(path);
+}
 static bool dirty = true;
 static time_t last_clock;
 static char wifi_ssid[33];
@@ -82,7 +143,7 @@ static void render_list(const char *title, const char *const *items, size_t coun
     const size_t end = count < first + 6 ? count : first + 6;
     for (size_t i = first; i < end; ++i) {
         char line[128];
-        snprintf(line, sizeof(line), "%s%s\n", i == selection ? "> " : "  ", items[i]);
+        snprintf(line, sizeof(line), "%s%.24s\n", i == selection ? "> " : "  ", items[i]);
         strlcat(body, line, sizeof(body));
     }
     lv_label_set_text(body_label, body[0] ? body : "  (empty)");
@@ -95,7 +156,10 @@ static void render_music(void)
     const size_t count = MusicPlayer_GetTrackCount();
     for (size_t i = 0; i < count; ++i) names[i] = MusicPlayer_GetTrackName(i);
     render_list("Music", names, count);
-    if (!MusicPlayer_IsSDMounted()) lv_label_set_text(body_label, "No SD card\n\nInsert FAT32 card");
+    if (!MusicPlayer_IsSDMounted()) {
+        lv_label_set_text_fmt(body_label, "%s\n\nA checks SD card", MusicPlayer_GetSDStatus());
+        lv_label_set_text(footer_label, "A scan  B back");
+    }
 }
 
 static void render_info(const char *title, const char *text, const char *footer)
@@ -178,10 +242,16 @@ static void render_files(void)
         render_info("Files", text, "Please wait");
     } else if (MusicPlayer_IsSDMounted()) {
         static const char *names[MUSIC_MAX_FILES];
-        const size_t count = MusicPlayer_GetFileCount();
-        for (size_t i = 0; i < count; ++i) names[i] = MusicPlayer_GetFileName(i);
-        render_list("Files", names, count);
-        lv_label_set_text(footer_label, "Up/Down browse  Start scan");
+        files_refresh();
+        for (size_t i = 0; i < files_row_count; ++i) {
+            const char *path = MusicPlayer_GetFileName(files_rows[i]);
+            names[i] = path && files_is_child(files_path, path) ? path + strlen(files_path) : "";
+        }
+        char title[32];
+        snprintf(title, sizeof(title), "Files /%.22s", files_path);
+        render_list(title, names, files_row_count);
+        if (!files_row_count) lv_label_set_text(body_label, "This folder is empty");
+        lv_label_set_text(footer_label, files_notice[0] ? files_notice : "A open/play  B up");
     } else {
         snprintf(text, sizeof(text), "%s\n\nPress A to check", MusicPlayer_GetSDStatus());
         render_info("Files", text, "A scan  B back");
@@ -265,8 +335,8 @@ static OSD_Result_t draw(void *arg)
         const int index = MusicPlayer_GetCurrentIndex();
         const char *name = index >= 0 ? MusicPlayer_GetTrackName((size_t)index) : NULL;
         char text[180];
-        snprintf(text, sizeof(text), "Now Playing\n\n%s\n\n%s", name ? name : "Nothing selected",
-                 MusicPlayer_GetState() == kMusicState_Playing ? "Playing" : "Stopped");
+        snprintf(text, sizeof(text), "Now Playing\n\n%.96s\n\n%s", name ? name : "Nothing selected",
+                 MusicPlayer_GetState() == kMusicState_Playing ? "Playing" : MusicPlayer_GetState() == kMusicState_Error ? "File read/playback error" : "Stopped");
         render_info("Player", text, "A play   B stop/back");
         break;
     }
@@ -281,7 +351,7 @@ static OSD_Result_t draw(void *arg)
     case PAGE_WIFI_PASSWORD: render_password(); break;
     case PAGE_BLUETOOTH: render_bluetooth(); break;
     case PAGE_SETTINGS: render_settings(); break;
-    case PAGE_ABOUT: render_info("About", "ChromaPlayer\nPrivate prototype 0.1\n\nFPGA 19.0 / MCU 4.3", "B back"); break;
+    case PAGE_ABOUT: render_info("About", "ChromaPlayer\nPrivate prototype 0.1\n\nFPGA 19.1 / MCU 4.3", "B back"); break;
     case PAGE_DIAGNOSTICS: render_diagnostics(); break;
     }
     return kOSD_Result_Ok;
@@ -300,10 +370,11 @@ static OSD_Result_t on_button(Button_t button, ButtonState_t state, void *arg)
 {
     (void)arg;
     if (state != kButtonState_Pressed) return kOSD_Result_Ok;
+    if (page == PAGE_FILES) files_refresh();
     size_t count = page == PAGE_HOME ? ARRAY_SIZE(home_items) :
                    page == PAGE_MUSIC ? MusicPlayer_GetTrackCount() :
                    page == PAGE_RADIO ? Radio_GetStationCount() :
-                   page == PAGE_FILES ? MusicPlayer_GetFileCount() :
+                   page == PAGE_FILES ? files_row_count :
                    page == PAGE_REMINDERS ? Reminders_Count() :
                    page == PAGE_WIFI ? Connectivity_WifiCount() :
                    page == PAGE_BLUETOOTH ? Connectivity_BluetoothCount() :
@@ -335,18 +406,34 @@ static OSD_Result_t on_button(Button_t button, ButtonState_t state, void *arg)
     else if (button == kButton_Down && selection + 1 < count) { ++selection; dirty = true; }
     else if (button == kButton_B) {
         if (page == PAGE_HOME) OSD_SetVisiblityState(false);
-        else if (page == PAGE_NOW_PLAYING) { MusicPlayer_Stop(); set_page(PAGE_MUSIC); }
+        else if (page == PAGE_NOW_PLAYING) { MusicPlayer_Stop(); set_page(player_return_page); }
+        else if (page == PAGE_FILES && files_up()) { dirty = true; }
         else if (page == PAGE_RADIO) { Radio_Stop(); set_page(PAGE_HOME); }
         else set_page(PAGE_HOME);
     } else if (button == kButton_A) {
         if (page == PAGE_HOME) home_select();
+        else if (page == PAGE_MUSIC && !MusicPlayer_IsSDMounted()) { files_path[0] = 0; MusicPlayer_StartScan(); set_page(PAGE_FILES); }
         else if (page == PAGE_MUSIC && count) {
             if (MusicPlayer_GetState() == kMusicState_Playing) MusicPlayer_Stop();
-            if (MusicPlayer_PlayIndex(selection) == 0) set_page(PAGE_NOW_PLAYING);
+            if (MusicPlayer_PlayIndex(selection) == 0) { player_return_page = PAGE_MUSIC; set_page(PAGE_NOW_PLAYING); }
         } else if (page == PAGE_RADIO && count) {
             Radio_Start(selection); dirty = true;
         } else if (page == PAGE_FILES) {
-            if (!MusicPlayer_IsSDMounted()) MusicPlayer_StartScan();
+            files_notice[0] = 0;
+            if (!MusicPlayer_IsSDMounted()) {
+                files_path[0] = 0; MusicPlayer_StartScan();
+            } else if (selection < files_row_count) {
+                const size_t file = files_rows[selection];
+                const char *path = MusicPlayer_GetFileName(file);
+                size_t length = path ? strlen(path) : 0;
+                if (length && path[length - 1] == '/') {
+                    strlcpy(files_path, path, sizeof(files_path)); selection = 0;
+                } else {
+                    int result = MusicPlayer_PlayFileIndex(file);
+                    if (!result) { player_return_page = PAGE_FILES; set_page(PAGE_NOW_PLAYING); }
+                    else strlcpy(files_notice, result == -2 ? "Select an MP3 to play" : "Player busy - retry A", sizeof(files_notice));
+                }
+            }
             dirty = true;
         } else if (page == PAGE_DIAGNOSTICS) { MusicPlayer_StartScan(); dirty = true; }
         else if (page == PAGE_WIFI) {
@@ -370,7 +457,7 @@ static OSD_Result_t on_button(Button_t button, ButtonState_t state, void *arg)
             case 1: FrameBlend_Update(FrameBlend_GetState() == kFrameBlendState_On ? kFrameBlendState_Off : kFrameBlendState_On); break;
             case 2: ColorCorrectLCD_Update(ColorCorrectLCD_GetState() == kColorCorrectLCDState_On ? kColorCorrectLCDState_Off : kColorCorrectLCDState_On); break;
             case 3: ColorCorrectUSB_Update(ColorCorrectUSB_GetState() == kColorCorrectUSBState_On ? kColorCorrectUSBState_Off : kColorCorrectUSBState_On); break;
-            case 4: MusicPlayer_Rescan(); break;
+            case 4: files_path[0] = 0; MusicPlayer_StartScan(); set_page(PAGE_FILES); break;
             case 5: set_page(PAGE_WIFI); break;
             case 6: set_page(PAGE_BLUETOOTH); break;
             case 7: set_page(PAGE_ABOUT); break;
@@ -384,7 +471,7 @@ static OSD_Result_t on_button(Button_t button, ButtonState_t state, void *arg)
             MusicPlayer_PlayIndex((size_t)MusicPlayer_GetCurrentIndex()); dirty = true;
         }
     } else if (page == PAGE_FILES && button == kButton_Start) {
-        MusicPlayer_StartScan(); dirty = true;
+        files_path[0] = 0; files_notice[0] = 0; selection = 0; MusicPlayer_StartScan(); dirty = true;
     } else if (page == PAGE_REMINDERS && button == kButton_Start) {
         time_t now = time(NULL) + 300;
         struct tm local; localtime_r(&now, &local);

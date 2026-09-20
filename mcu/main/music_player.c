@@ -34,6 +34,7 @@
 #include "connectivity.h"
 #include "minimp3_ex.h"
 #include "audio_fixture.h"
+#include "ipod_ui.h"
 
 #define MUSIC_MOUNT_POINT "/sdcard"
 #define MUSIC_I2S_PORT I2S_NUM_0
@@ -42,7 +43,7 @@
 
 #define MUSIC_DIAG(level, fmt, ...) printf("music " level ": " fmt "\n", ##__VA_ARGS__)
 static TaskHandle_t s_player_task;
-static char s_path[256];
+static char s_path[MUSIC_MAX_NAME + 16];
 static volatile bool s_stop_requested;
 static bool s_sd_mounted;
 static sdmmc_card_t *s_card;
@@ -350,7 +351,7 @@ static void scan_dir(const char *absolute, const char *relative, int depth)
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL && s_track_count < MUSIC_MAX_TRACKS) {
         if (entry->d_name[0] == '.') continue;
-        char abs_child[256];
+        char abs_child[MUSIC_MAX_NAME + 16];
         char rel_child[MUSIC_MAX_NAME];
         if (strlen(absolute) + 1 + strlen(entry->d_name) >= sizeof(abs_child) ||
             strlen(relative) + (relative[0] ? 1 : 0) + strlen(entry->d_name) >= sizeof(rel_child)) {
@@ -364,6 +365,7 @@ static void scan_dir(const char *absolute, const char *relative, int depth)
         strlcat(rel_child, entry->d_name, sizeof(rel_child));
         struct stat st;
         if (stat(abs_child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode) && strlen(rel_child) + 1 >= MUSIC_MAX_NAME) continue;
         size_t size = strlen(rel_child) + 1 + (S_ISDIR(st.st_mode) ? 1 : 0);
         if (size > MUSIC_INDEX_BYTES - s_index_used) { s_index_full = true; break; }
         char *stored = s_index + s_index_used;
@@ -495,6 +497,7 @@ bool MusicPlayer_IsSDMounted(void) { return s_sd_mounted; }
 size_t MusicPlayer_Rescan(void)
 {
     if (s_scan_task || s_player_task) return s_track_count;
+    s_current_index = -1;
     s_track_count = 0;
     s_file_count = 0;
     s_index_used = 0;
@@ -578,6 +581,7 @@ static void scan_task(void *unused)
         s_card = NULL;
         s_sd_spi = false;
     }
+    s_current_index = -1;
     s_track_count = 0;
     s_file_count = 0;
     s_index_used = 0;
@@ -657,13 +661,28 @@ const char *MusicPlayer_GetFileName(size_t index)
 
 int MusicPlayer_PlayIndex(size_t index)
 {
-    if (!s_sd_mounted || index >= s_track_count || s_player_task || s_radio_task || s_scan_task) return -1;
+    if (!s_sd_mounted || index >= s_track_count || s_scan_task) return -1;
+    // Let the audio owners drain/close before opening the requested SD track.
+    if (s_radio_task) s_radio_stop = true;
+    if (s_player_task) s_stop_requested = true;
+    for (unsigned i = 0; i < 100 && (s_radio_task || s_player_task); ++i)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_radio_task || s_player_task) return -1;
     if (!audio_bridge_ready()) { s_state = kMusicState_Error; return -1; }
     s_current_index = (int)index;
     s_stop_requested = false;
     snprintf(s_path, sizeof(s_path), MUSIC_MOUNT_POINT "/%s", s_track_paths[index]);
     return xTaskCreatePinnedToCore(player_task, "mp3_player", 24576, NULL, 5,
                                    &s_player_task, 0) == pdPASS ? 0 : -1;
+}
+
+int MusicPlayer_PlayFileIndex(size_t index)
+{
+    if (!s_sd_mounted || s_scan_task || index >= s_file_count) return -1;
+    const char *path = s_file_names[index];
+    for (size_t track = 0; track < s_track_count; ++track)
+        if (!strcmp(path, s_track_paths[track])) return MusicPlayer_PlayIndex(track);
+    return -2;
 }
 
 void MusicPlayer_Stop(void)
@@ -796,6 +815,7 @@ static int sd_pad_diagnostic(void)
 static int diagnostic_command(int argc, char **argv)
 {
     if (argc < 2) return 1;
+    if (!strcmp(argv[1], "browsertest")) { bool ok = IPodUI_TestFileNavigation(); MUSIC_DIAG("I", "BROWSER_TEST %s", ok ? "PASS (13 checks)" : "FAIL"); return ok ? 0 : 1; }
     if (!strcmp(argv[1], "mute")) { audio_mute(); return 0; }
     if (!strcmp(argv[1], "unmute")) {
         if (!audio_bridge_ready()) return 1;
