@@ -1,0 +1,10 @@
+{
+  "mcu": {
+    "upstream": "https://github.com/ModRetro/oss-chromatic-console-mcu.git",
+    "base_commit": "6c94613da72420f6a364e0024681401bd69184ba"
+  },
+  "fpga": {
+    "upstream": "https://github.com/ModRetro/oss-chromatic-console-fpga.git",
+    "base_commit": "210176f9b7a4e6a8c25190e4a1620d2c1c97ba74"
+  }
+}

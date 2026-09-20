@@ -1,0 +1,14 @@
+**/build/
+**/build.*/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+**/*.log
+**/*.gprj.user
+fpga/esp32t/impl/gwsynthesis/
+fpga/esp32t/impl/pnr/
+fpga/esp32t/impl/temp/
+.env
+.env.*
+*.nvs
+*.lic
