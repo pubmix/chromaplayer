@@ -28,3 +28,5 @@ void FPGA_Rx_UseBrightnessReadback(void);
 void FPGA_Tx_PokeButtons(void);
 
 unsigned long FPGA_Rx_GetAudioDiagnostic(void);
+unsigned FPGA_Rx_GetAudioVersion(void);
+void FPGA_Rx_InvalidateAudioVersion(void);

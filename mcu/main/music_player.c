@@ -48,6 +48,7 @@ static bool s_sd_mounted;
 static sdmmc_card_t *s_card;
 static bool s_sd_spi;
 static bool s_probe_spi;
+static bool s_sd_data_timeout;
 static volatile MusicScanState_t s_scan_state = kMusicScan_Idle;
 static volatile unsigned s_scan_progress;
 static TaskHandle_t s_scan_task;
@@ -61,6 +62,26 @@ static size_t s_index_used;
 static bool s_index_full;
 static size_t s_file_count;
 static char *s_file_names[MUSIC_MAX_FILES];
+
+static void audio_mute(void)
+{
+    SettingValue_t mute = { .eType = kSettingDataType_U8, .U8 = 1 };
+    SilentMode_ApplySetting(&mute);
+    FPGA_Tx_SendSysCtl();
+}
+
+static bool audio_bridge_ready(void)
+{
+    FPGA_Rx_InvalidateAudioVersion();
+    FPGA_Tx_SendAll();
+    for (unsigned i = 0; i < 50 && FPGA_Rx_GetAudioVersion() == 0xffff; ++i)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    unsigned version = FPGA_Rx_GetAudioVersion();
+    if (version == ((1U << 6) | 19U)) return true;
+    audio_mute();
+    MUSIC_DIAG("E", "Audio blocked: FPGA version=%04x, requires 19.1", version);
+    return false;
+}
 
 typedef struct {
     const char *name;
@@ -113,6 +134,22 @@ static void radio_input_task(void *arg)
     }
     input->done = true;
     vTaskDelete(NULL);
+}
+
+// Keep the radio route selected while draining the old station to silence.
+// Only the playback task writes DMA; UI station changes just update the request.
+static void radio_fade_out(int16_t left, int16_t right)
+{
+    int16_t ramp[256 * 2];
+    for (int i = 0; i < 256; ++i) {
+        ramp[i * 2] = (int32_t)left * (255 - i) / 256;
+        ramp[i * 2 + 1] = (int32_t)right * (255 - i) / 256;
+    }
+    size_t written;
+    i2s_write(MUSIC_I2S_PORT, ramp, sizeof(ramp), &written, pdMS_TO_TICKS(200));
+    memset(ramp, 0, sizeof(ramp));
+    for (int i = 0; i < 12; ++i)
+        i2s_write(MUSIC_I2S_PORT, ramp, sizeof(ramp), &written, pdMS_TO_TICKS(200));
 }
 
 static void radio_task(void *unused)
@@ -196,6 +233,8 @@ static void radio_task(void *unused)
         unsigned total_frames = 0, total_bytes = 0;
         TickType_t started = xTaskGetTickCount();
         unsigned valid_frames = 0;
+        unsigned fade_frames = 0;
+        int16_t last_left = 0, last_right = 0;
         i2s_zero_dma_buffer(MUSIC_I2S_PORT);
         while (!s_radio_stop && station == s_radio_station) {
             if (s_radio_diagnostic && xTaskGetTickCount() - started > pdMS_TO_TICKS(20000)) break;
@@ -240,7 +279,6 @@ static void radio_task(void *unused)
                 MUSIC_DIAG("I", "RADIO_DECODE station=%d frames=%u bytes=%u hz=%d channels=%d peak=%d stack_free=%u", station, total_frames, total_bytes, info.hz, info.channels, peak, (unsigned)uxTaskGetStackHighWaterMark(NULL));
             if (s_radio_output && valid_frames >= 3) {
                 if (output_rate != info.hz) {
-                    gpio_set_level(PIN_NUM_AUDIO_ROUTE, 0);
                     i2s_zero_dma_buffer(MUSIC_I2S_PORT);
                     if (i2s_set_clk(MUSIC_I2S_PORT, info.hz, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO) != ESP_OK) break;
                     output_rate = info.hz;
@@ -252,6 +290,13 @@ static void radio_task(void *unused)
                 } else {
                     for (int i = 0; i < samples*2; ++i) pcm[i] /= attenuation;
                 }
+                const unsigned fade_length = info.hz / 50; // 20 ms fade in
+                for (int i = 0; i < samples && fade_frames < fade_length; ++i, ++fade_frames) {
+                    pcm[i * 2] = (int32_t)pcm[i * 2] * (int32_t)fade_frames / (int32_t)fade_length;
+                    pcm[i * 2 + 1] = (int32_t)pcm[i * 2 + 1] * (int32_t)fade_frames / (int32_t)fade_length;
+                }
+                last_left = pcm[(samples - 1) * 2];
+                last_right = pcm[(samples - 1) * 2 + 1];
                 gpio_set_level(PIN_NUM_AUDIO_ROUTE, 1);
                 size_t written = 0;
                 size_t size = samples * 2 * sizeof(*pcm);
@@ -264,12 +309,12 @@ static void radio_task(void *unused)
             }
 
         }
+        if (s_radio_output) radio_fade_out(last_left, last_right);
         source.stop = true;
         while (!source.done) vTaskDelay(1);
         vStreamBufferDelete(source.bytes);
         i2s_zero_dma_buffer(MUSIC_I2S_PORT);
         MUSIC_DIAG("I", "RADIO_RESULT station=%d frames=%u bytes=%u stop=%d", station, total_frames, total_bytes, s_radio_stop);
-        gpio_set_level(PIN_NUM_AUDIO_ROUTE, 0);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         if (!s_radio_stop && station == s_radio_station) {
@@ -289,59 +334,6 @@ finished:
     s_radio_stop = false;
     if (s_radio_state != kRadio_Error) radio_set_status(kRadio_Stopped, "Stopped");
     vTaskDelete(NULL);
-}
-
-static uint8_t raw_spi_byte(uint8_t out)
-{
-    uint8_t in = 0;
-    for (int bit = 7; bit >= 0; --bit) {
-        gpio_set_level(PIN_NUM_SD_CLK, 0);
-        gpio_set_level(PIN_NUM_SD_CMD, (out >> bit) & 1);
-        esp_rom_delay_us(4);
-        gpio_set_level(PIN_NUM_SD_CLK, 1);
-        in = (uint8_t)((in << 1) | gpio_get_level(PIN_NUM_SD_D0));
-        esp_rom_delay_us(4);
-    }
-    gpio_set_level(PIN_NUM_SD_CLK, 0);
-    return in;
-}
-
-// Minimal, low-speed electrical probe. A valid card answers CMD0 with R1=01.
-// FF means no response reached D0 and points below the filesystem layer.
-static uint8_t raw_spi_cmd0(void)
-{
-    // A failed native mount can leave the SDMMC peripheral attached to these
-    // pads. Release it and reset the matrix before bit-banging the probe.
-    sdmmc_host_deinit();
-    gpio_reset_pin(PIN_NUM_SD_CLK);
-    gpio_reset_pin(PIN_NUM_SD_CMD);
-    gpio_reset_pin(PIN_NUM_SD_D0);
-    gpio_reset_pin(PIN_NUM_SD_D3);
-    gpio_config_t outputs = {
-        .pin_bit_mask = BIT64(PIN_NUM_SD_CLK) | BIT64(PIN_NUM_SD_CMD) |
-                        BIT64(PIN_NUM_SD_D3),
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-    };
-    gpio_config_t input = {
-        .pin_bit_mask = BIT64(PIN_NUM_SD_D0),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&outputs);
-    gpio_config(&input);
-    gpio_set_level(PIN_NUM_SD_D3, 1);
-    gpio_set_level(PIN_NUM_SD_CMD, 1);
-    for (int i = 0; i < 12; ++i) raw_spi_byte(0xFF);
-    gpio_set_level(PIN_NUM_SD_D3, 0);
-    raw_spi_byte(0xFF);
-    const uint8_t cmd0[] = { 0x40, 0, 0, 0, 0, 0x95 };
-    for (size_t i = 0; i < sizeof(cmd0); ++i) raw_spi_byte(cmd0[i]);
-    uint8_t response = 0xFF;
-    for (int i = 0; i < 16 && response == 0xFF; ++i)
-        response = raw_spi_byte(0xFF);
-    gpio_set_level(PIN_NUM_SD_D3, 1);
-    raw_spi_byte(0xFF);
-    return response;
 }
 
 static bool has_mp3_extension(const char *name)
@@ -468,6 +460,7 @@ static struct {
 static int play_command(int argc, char **argv)
 {
     if (!s_sd_mounted || s_radio_task || s_scan_task) return 1;
+    if (!audio_bridge_ready()) return 1;
     if (arg_parse(argc, argv, (void **)&s_play_args) != 0) {
         arg_print_errors(stderr, s_play_args.end, argv[0]);
         return 1;
@@ -510,6 +503,18 @@ size_t MusicPlayer_Rescan(void)
     return s_track_count;
 }
 
+static esp_err_t (*sd_host_transaction)(int, sdmmc_command_t *);
+static esp_err_t sd_trace_transaction(int slot, sdmmc_command_t *cmd)
+{
+    esp_err_t err = sd_host_transaction(slot, cmd);
+    if (cmd->opcode == 51 && (err == ESP_ERR_TIMEOUT || cmd->error == ESP_ERR_TIMEOUT)) s_sd_data_timeout = true;
+    if (cmd->opcode != 17 && cmd->opcode != 18)
+        MUSIC_DIAG("I", "SD_CMD op=%u arg=%08lx flags=%08lx result=%s command=%s response=%08lx",
+                   (unsigned)cmd->opcode, (unsigned long)cmd->arg, (unsigned long)cmd->flags,
+                   esp_err_to_name(err), esp_err_to_name(cmd->error), (unsigned long)cmd->response[0]);
+    return err;
+}
+
 static esp_err_t mount_card(void)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount = {
@@ -528,6 +533,8 @@ static esp_err_t mount_card(void)
         MUSIC_DIAG("I", "SD SPI2 bus=%s", esp_err_to_name(err));
         if (err != ESP_OK) return err;
         sdmmc_host_t spi_host = SDSPI_HOST_DEFAULT();
+        sd_host_transaction = spi_host.do_transaction;
+        spi_host.do_transaction = sd_trace_transaction;
         spi_host.slot = SPI2_HOST;
         spi_host.max_freq_khz = 400;
         sdspi_device_config_t spi_slot = SDSPI_DEVICE_CONFIG_DEFAULT();
@@ -539,9 +546,14 @@ static esp_err_t mount_card(void)
         else s_sd_spi = true;
         return err;
     }
+    // Reclaim pins after a prior SPI probe before enabling native SDMMC.
+    const gpio_num_t sd_pins[] = { PIN_NUM_SD_CLK, PIN_NUM_SD_CMD, PIN_NUM_SD_D0, PIN_NUM_SD_D1, PIN_NUM_SD_D2, PIN_NUM_SD_D3 };
+    for (size_t i = 0; i < sizeof(sd_pins) / sizeof(sd_pins[0]); ++i) gpio_reset_pin(sd_pins[i]);
     gpio_set_pull_mode(PIN_NUM_SD_CMD, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode(PIN_NUM_SD_D0, GPIO_PULLUP_ONLY);
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sd_host_transaction = host.do_transaction;
+    host.do_transaction = sd_trace_transaction;
     host.slot = SDMMC_HOST_SLOT_1;
     host.max_freq_khz = 10000;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -549,12 +561,6 @@ static esp_err_t mount_card(void)
     slot.cd = SDMMC_SLOT_NO_CD;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     esp_err_t err = esp_vfs_fat_sdmmc_mount(MUSIC_MOUNT_POINT, &host, &slot, &mount, &s_card);
-    if (err != ESP_OK) {
-        MUSIC_DIAG("W", "Native SD failed: %s; trying SPI", esp_err_to_name(err));
-        s_probe_spi = true;
-        err = mount_card();
-        s_probe_spi = false;
-    }
     return err;
 }
 
@@ -578,18 +584,18 @@ static void scan_task(void *unused)
     s_index_full = false;
     s_scan_progress = 35;
     vTaskDelay(pdMS_TO_TICKS(250));
+    s_sd_data_timeout = false;
     esp_err_t err = mount_card();
     if (err != ESP_OK) {
-        const uint8_t raw = raw_spi_cmd0();
         s_scan_progress = 100;
         s_scan_state = gpio_get_level(PIN_NUM_SD_DETECT) ?
                        kMusicScan_NoCard : kMusicScan_MountError;
-        MUSIC_DIAG("W", "%s CD:%d K:%d M:%d D:%d%d%d%d R:%02X",
+        MUSIC_DIAG("W", "%s CD:%d K:%d M:%d D:%d%d%d%d",
                  esp_err_to_name(err), gpio_get_level(PIN_NUM_SD_DETECT),
                  gpio_get_level(PIN_NUM_SD_CLK), gpio_get_level(PIN_NUM_SD_CMD),
                  gpio_get_level(PIN_NUM_SD_D0), gpio_get_level(PIN_NUM_SD_D1),
-                 gpio_get_level(PIN_NUM_SD_D2), gpio_get_level(PIN_NUM_SD_D3), raw);
-        strlcpy(s_sd_status, gpio_get_level(PIN_NUM_SD_DETECT) ? "Insert a microSD card" : "Card not responding", sizeof(s_sd_status));
+                 gpio_get_level(PIN_NUM_SD_D2), gpio_get_level(PIN_NUM_SD_D3));
+        strlcpy(s_sd_status, s_sd_data_timeout ? "Card data read timed out" : gpio_get_level(PIN_NUM_SD_DETECT) ? "Insert a microSD card" : "Card not responding", sizeof(s_sd_status));
     } else {
         if (!s_index) s_index = malloc(MUSIC_INDEX_BYTES);
         if (!s_index) {
@@ -652,6 +658,7 @@ const char *MusicPlayer_GetFileName(size_t index)
 int MusicPlayer_PlayIndex(size_t index)
 {
     if (!s_sd_mounted || index >= s_track_count || s_player_task || s_radio_task || s_scan_task) return -1;
+    if (!audio_bridge_ready()) { s_state = kMusicState_Error; return -1; }
     s_current_index = (int)index;
     s_stop_requested = false;
     snprintf(s_path, sizeof(s_path), MUSIC_MOUNT_POINT "/%s", s_track_paths[index]);
@@ -680,13 +687,15 @@ const char *Radio_GetStatus(void) { return s_radio_status; }
 bool Radio_Start(size_t index)
 {
     if (index >= Radio_GetStationCount() || s_player_task || s_scan_task || s_radio_stop) return false;
+    if (!audio_bridge_ready()) {
+        radio_set_status(kRadio_Error, "Update FPGA audio firmware");
+        return false;
+    }
     if (!Connectivity_WifiConnected()) {
         radio_set_status(kRadio_Error, "Connect Wi-Fi first");
         return false;
     }
     if (s_radio_task && s_radio_diagnostic) return false;
-    gpio_set_level(PIN_NUM_AUDIO_ROUTE, 0);
-    i2s_zero_dma_buffer(MUSIC_I2S_PORT);
     s_radio_station = (int)index;
     if (s_radio_task) {
         radio_set_status(kRadio_Connecting, "Switching station...");
@@ -782,9 +791,17 @@ static int sd_pad_diagnostic(void)
     return 0;
 }
 
+#include "sd_native_probe.h"
+
 static int diagnostic_command(int argc, char **argv)
 {
     if (argc < 2) return 1;
+    if (!strcmp(argv[1], "mute")) { audio_mute(); return 0; }
+    if (!strcmp(argv[1], "unmute")) {
+        if (!audio_bridge_ready()) return 1;
+        SettingValue_t mute = { .eType = kSettingDataType_U8, .U8 = 0 };
+        SilentMode_ApplySetting(&mute); FPGA_Tx_SendSysCtl(); return 0;
+    }
     if (!strcmp(argv[1], "wifidrop")) return esp_wifi_disconnect() == ESP_OK ? 0 : 1;
     if (!strcmp(argv[1], "filetest")) {
         if (s_player_task || s_radio_task || s_scan_task) return 1;
@@ -795,6 +812,7 @@ static int diagnostic_command(int argc, char **argv)
         return 0;
     }
     if (!strcmp(argv[1], "play") && argc == 3) return Radio_Start(atoi(argv[2])) ? 0 : 1;
+    if (!strcmp(argv[1], "sdnative")) { if (s_scan_task || s_sd_mounted || s_player_task || s_radio_task) return 1; return sd_native_probe(); }
     if (!strcmp(argv[1], "pads")) return sd_pad_diagnostic();
     if (!strcmp(argv[1], "fpga")) { FPGA_Tx_SendAll(); vTaskDelay(pdMS_TO_TICKS(200)); MUSIC_DIAG("I", "FPGA_AUDIO diag=%08lx", FPGA_Rx_GetAudioDiagnostic()); return 0; }
     if (!strcmp(argv[1], "tone")) {
@@ -888,4 +906,3 @@ void MusicPlayer_Initialize(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&play));
     ESP_ERROR_CHECK(esp_console_cmd_register(&stop));
 }
-

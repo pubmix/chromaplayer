@@ -6,12 +6,12 @@ Experimental music-player firmware for the ModRetro Chromatic, maintained by pub
 
 - Internet Radio: Groove Salad, Drone Zone, and GS Classic tested with live streams, station switching, buffered I2S output, and automatic Wi-Fi reconnection.
 - Digital audio: verified through raw USB capture. A 1 kHz test tone measured correctly without spikes. Generated MP3 fixtures verified stereo 48 kHz and mono 22.05 kHz playback with a sample-rate change.
-- SD access: **unresolved on the test console**. Card detect reports inserted, but native SDMMC and SPI initialization time out before filesystem access. SD file playback has not been verified using a real card.
-- Files UI: read-only list of scanned files/folder paths and rescan controls. No interactive folder navigation, rename, copy, move, delete, or folder creation.
+- SD access: **unresolved on the test console**. The installed card responds to native commands including identification and selection, but its first D0 data transfer (ACMD51/SCR) times out. Reseating the card did not change this result; a separate slow native GPIO test also received valid commands but no data bits. Normal scans stay in native SD mode; SPI is an explicit diagnostic only. SD file playback has not been verified using a real card.
+- Files UI: read-only list of scanned files/folder paths and rescan controls. The user confirmed the physical LCD displays the scan error correctly. No interactive folder navigation, rename, copy, move, delete, or folder creation.
 - Bluetooth: disabled in this build because of ESP32 RAM constraints.
-- Speaker/headphone listening confirmation remains pending. Raw USB verification does not establish acoustic quality.
+- Speaker: user confirmed clear radio music. A reported station-switch click prompted serialized DMA transitions and short fades; digital captures pass, speaker confirmation of the transition fix remains pending. Headphones have not been confirmed.
 
-This is a development snapshot, not a completed or production-ready release. The tested FPGA image was loaded into SRAM only and must be reloaded after power cycling. The MCU application is persistent. Automatic idle sleep is currently disabled so Wi-Fi and I2S remain active; battery idle optimization is unfinished. FPGA timing reports include memory-reset recovery violations that still need review.
+This is a development snapshot, not a completed or production-ready release. The FPGA image was programmed and verified in external flash and successfully reloaded from flash with usercode `43505231` (version 19.1). The MCU application is persistent. Normal playback checks the fresh FPGA version and blocks/mutes incompatible images. A user-performed power cycle retained FPGA 19.1. Automatic idle sleep is currently disabled so Wi-Fi and I2S remain active; battery idle optimization is unfinished. FPGA timing reports include memory-reset recovery violations that still need review.
 
 ## Layout
 

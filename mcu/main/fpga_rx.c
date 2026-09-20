@@ -1,5 +1,8 @@
 static volatile unsigned long audio_diagnostic;
 unsigned long FPGA_Rx_GetAudioDiagnostic(void) { return audio_diagnostic; }
+static volatile unsigned audio_version = 0xffff;
+unsigned FPGA_Rx_GetAudioVersion(void) { return audio_version; }
+void FPGA_Rx_InvalidateAudioVersion(void) { audio_version = 0xffff; }
 #include "fpga_rx.h"
 
 #include "battery.h"
@@ -358,6 +361,7 @@ static void ProcessMessage(const RxMsg_t *const pMsg)
             const uint8_t fpga_version_minor = (uint8_t)((rxdata >> 6) & 0x3F);
             const uint8_t fpga_version_major = (uint8_t)((rxdata >> 0) & 0x3F);
             Firmware_SetFPGAVersion(fpga_version_major, fpga_version_minor, fpga_debug);
+            audio_version = (fpga_version_minor << 6) | fpga_version_major;
             break;
         }
         case kRxCmd_StatusExtended:
